@@ -1812,6 +1812,8 @@ class GatewaySlashCommandsMixin:
         user_provs = None
         custom_provs = None
         excluded_provs = []
+        picker_scope = "all"
+        routing_pairs: frozenset = frozenset()
         config_path = (_command_profile_home or _hermes_home) / "config.yaml"
         try:
             cfg = _load_gateway_config(config_path=config_path)
@@ -1830,8 +1832,18 @@ class GatewaySlashCommandsMixin:
                 _excl = cfg.get("model_catalog", {}).get("excluded_providers")
                 if isinstance(_excl, list):
                     excluded_provs = _excl
+                try:
+                    from hermes_cli.inventory import resolve_routing_scope
+                    picker_scope, routing_pairs = resolve_routing_scope(cfg)
+                except Exception:
+                    picker_scope, routing_pairs = "all", frozenset()
         except Exception:
             pass
+        # --all (#6673) bypasses picker_scope for this one listing, whether
+        # it comes from the interactive picker or the text-list fallback.
+        # Never affects the switch itself — see below.
+        if request.show_all:
+            picker_scope = "all"
 
         # Check for session override. Normalize the source the same way a normal
         # message turn does
@@ -1874,6 +1886,8 @@ class GatewaySlashCommandsMixin:
                         max_models=50,
                         include_moa=True,
                         excluded_providers=excluded_provs,
+                        picker_scope=picker_scope,
+                        routing_pairs=routing_pairs,
                     )
                 except Exception:
                     providers = []
@@ -2173,6 +2187,11 @@ class GatewaySlashCommandsMixin:
             try:
                 # Offload blocking provider-listing off the event loop so the
                 # gateway doesn't freeze on a stale-cache HTTP fetch. See #41289.
+                # Under picker_scope="routing" (#6673), fetch unclipped so
+                # apply_routing_scope() sees every curated model before the
+                # 5-per-row display cap below — clipping to 5 first could
+                # silently drop the very routing model this scope exists to
+                # surface.
                 providers = await asyncio.to_thread(
                     list_authenticated_providers,
                     current_provider=current_provider,
@@ -2180,9 +2199,19 @@ class GatewaySlashCommandsMixin:
                     current_model=current_model,
                     user_providers=user_provs,
                     custom_providers=custom_provs,
-                    max_models=5,
+                    max_models=None if picker_scope == "routing" else 5,
                     excluded_providers=excluded_provs,
                 )
+                if picker_scope == "routing":
+                    from hermes_cli.inventory import apply_routing_scope
+
+                    providers = apply_routing_scope(
+                        providers, scope=picker_scope, routing_pairs=routing_pairs
+                    )
+                    # total_models above is already the routing-scoped count;
+                    # only the *displayed* slice is capped here.
+                    for _p in providers:
+                        _p["models"] = list(_p.get("models") or [])[:5]
                 for p in providers:
                     tag = t("gateway.model.current_tag") if p["is_current"] else ""
                     lines.append(f"**{p['name']}** `--provider {p['slug']}`{tag}:")

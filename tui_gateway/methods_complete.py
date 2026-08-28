@@ -483,6 +483,7 @@ def _(rid, params: dict) -> dict:
             explicit_only=bool(params.get("explicit_only")),
             include_unconfigured=bool(params.get("include_unconfigured")),
             refresh=bool(params.get("refresh")),
+            show_all=bool(params.get("all")),
         )
         return _ok(rid, payload)
     except Exception as e:

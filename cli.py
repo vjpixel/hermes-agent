@@ -11343,6 +11343,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     ctx,
                     probe_custom_providers=force_refresh,
                     probe_current_custom_provider=not force_refresh,
+                    scope_to_routing=True,
+                    show_all=request.show_all,
                 )["providers"]
             except Exception:
                 providers = []
