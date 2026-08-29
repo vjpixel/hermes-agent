@@ -3970,7 +3970,14 @@ def list_picker_providers(
       :func:`hermes_cli.inventory.apply_routing_scope` — the same filter
       the CLI/TUI/dashboard picker applies, so the gateway (Telegram/
       Discord) ``/model`` picker matches them instead of drifting with its
-      own copy of the restriction.
+      own copy of the restriction. Callers passing a numeric ``max_models``
+      together with ``picker_scope="routing"`` must pass ``max_models=None``
+      instead when scope is active — this function's OpenRouter live-
+      substitution above (and the base ``list_authenticated_providers``
+      curated-list truncation) both happen BEFORE the scope filter runs, so
+      a numeric cap can silently drop a routing-allowlisted model sitting
+      past that position — the same ordering hazard the gateway text-list
+      fallback in ``gateway/slash_commands.py`` documents and avoids.
 
     All other providers and metadata fields are passed through unchanged.
     The typed ``/model <name>`` path is unaffected -- only the interactive

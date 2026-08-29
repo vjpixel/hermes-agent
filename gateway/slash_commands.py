@@ -1836,6 +1836,17 @@ class GatewaySlashCommandsMixin:
                     from hermes_cli.inventory import resolve_routing_scope
                     picker_scope, routing_pairs = resolve_routing_scope(cfg)
                 except Exception:
+                    # Fail open to the unrestricted picker (#6673) — but log
+                    # it, since this differs from resolve_routing_scope's OWN
+                    # documented fail-open (unrecognized picker_scope string):
+                    # anything landing here is an unexpected bug (import
+                    # failure, malformed smart_model_routing shape it doesn't
+                    # defensively handle), not a config typo.
+                    logger.debug(
+                        "resolve_routing_scope failed — /model picker falling "
+                        "back to unrestricted listing",
+                        exc_info=True,
+                    )
                     picker_scope, routing_pairs = "all", frozenset()
         except Exception:
             pass
@@ -1876,6 +1887,14 @@ class GatewaySlashCommandsMixin:
                     # Offload blocking provider-listing (can fall through to a
                     # synchronous urllib HTTP fetch on a stale cache) off the
                     # event loop so the gateway doesn't freeze. See #41289.
+                    # Under picker_scope="routing" (#6673), fetch unclipped —
+                    # list_picker_providers() applies apply_routing_scope()
+                    # AFTER any max_models truncation, so capping at 50 here
+                    # could silently drop a routing-allowlisted model past
+                    # position 50 in a provider's curated list (e.g.
+                    # opencode-zen's ~65-entry catalog) before the routing
+                    # filter ever sees it. Mirrors the text-list fallback
+                    # branch below, which already gets this right.
                     providers = await asyncio.to_thread(
                         list_picker_providers,
                         current_provider=current_provider,
@@ -1883,7 +1902,7 @@ class GatewaySlashCommandsMixin:
                         current_model=current_model,
                         user_providers=user_provs,
                         custom_providers=custom_provs,
-                        max_models=50,
+                        max_models=None if picker_scope == "routing" else 50,
                         include_moa=True,
                         excluded_providers=excluded_provs,
                         picker_scope=picker_scope,
@@ -2223,7 +2242,7 @@ class GatewaySlashCommandsMixin:
                         lines.append(f"  `{p['api_url']}`")
                     lines.append("")
             except Exception:
-                pass
+                logger.debug("gateway /model text-list fallback failed", exc_info=True)
 
             lines.append(t("gateway.model.usage_switch_model"))
             lines.append(t("gateway.model.usage_switch_provider"))

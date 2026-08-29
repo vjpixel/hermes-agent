@@ -7228,7 +7228,9 @@ async def get_model_options(
     Models" control. Normal opens leave it false to stay on the 1h cache.
 
     ``show_all`` bypasses ``model_catalog.picker_scope: routing`` (#6673)
-    for this one request — the dashboard's "Show all models" control.
+    for this one request — intended for a dashboard "Show all models"
+    control; no such control is wired up as of this parameter's addition,
+    this is the query-param plumbing for one to call.
     """
     try:
         skew_msg = _dashboard_code_skew_guard()

@@ -33,8 +33,11 @@ Substrate facts (verified May 2026):
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from typing import Any, Optional
+
+_log = logging.getLogger(__name__)
 
 
 # ─── Public types ───────────────────────────────────────────────────────
@@ -169,6 +172,11 @@ def resolve_routing_scope(cfg: dict) -> tuple[str, frozenset[tuple[str, str]]]:
 
     scope = str(model_catalog_cfg.get("picker_scope") or "all").strip().lower()
     if scope not in ("all", "routing"):
+        _log.debug(
+            "Unrecognized model_catalog.picker_scope=%r — defaulting to 'all' "
+            "(full inventory). Valid values: 'all', 'routing'.",
+            scope,
+        )
         scope = "all"
 
     if scope != "routing":
@@ -205,7 +213,17 @@ def _row_provider_keys(row: dict) -> set[str]:
                 )
             )
         except Exception:
-            pass
+            # Falling back to slug-only matching here is exactly the
+            # failure mode this alias lookup exists to avoid (see
+            # docstring) — log it so a routing entry that vanishes from
+            # the picker for a custom provider has a breadcrumb instead
+            # of looking like a config mistake.
+            _log.warning(
+                "custom_provider_aliases failed for row slug=%r name=%r — "
+                "falling back to slug-only matching for picker_scope=routing",
+                row.get("slug"), row.get("name"),
+                exc_info=True,
+            )
     keys.discard("")
     return keys
 
@@ -334,11 +352,14 @@ def build_models_payload(
       any surface a human is choosing from, not for programmatic resolution.
     - ``scope_to_routing``: apply ``ctx.picker_scope``/``ctx.routing_pairs``
       (see :func:`apply_routing_scope`, #6673) after every other row
-      post-processing step. Only the surfaces that ARE the ``/model`` picker
-      set this True (``build_model_options_payload`` and the CLI ``/model``
-      picker); auxiliary-task pickers (vision, compression, recommended-
-      default resolution) and ``model.save_key`` leave it False on purpose —
-      those choices are not governed by chat-routing scope.
+      post-processing step. Defaults False; only the surfaces that ARE the
+      ``/model`` picker set this True (``build_model_options_payload`` and
+      the CLI ``/model`` picker). No other current caller sets it — every
+      non-``/model`` picker (vision, compression, recommended-default
+      resolution, ``model.save_key``, and any future auxiliary consumer)
+      leaves it at the False default on purpose, since those choices are
+      not governed by chat-routing scope. Check this default before wiring
+      a NEW caller rather than assuming the list above is exhaustive.
     - ``show_all``: per-call escape hatch (``/model --all``) that bypasses
       ``scope_to_routing`` for this one build, even when the config has
       ``picker_scope: routing``. Never affects the explicit ``/model <id>``
