@@ -1984,7 +1984,15 @@ def resolve_runtime_provider(
             or env_openai_base_url
             or env_openrouter_base_url
         )
-        if cfg_base_url and cfg_provider in {"auto", "custom"}:
+        # Only fold the persisted model.base_url into "custom endpoint" when
+        # we're inferring the provider from config (requested_provider ==
+        # "auto"). When the caller explicitly asked for "openrouter" (e.g. a
+        # /model switch to an openrouter alias while the session's primary
+        # provider is a local/custom endpoint like Ollama), that persisted
+        # base_url belongs to the OTHER provider and must not suppress the
+        # openrouter credential-pool lookup (fix: "No API key found for
+        # provider 'openrouter'" despite a pool credential existing).
+        if cfg_base_url and cfg_provider in {"auto", "custom"} and requested_provider != "openrouter":
             has_custom_endpoint = True
         has_runtime_override = bool(explicit_api_key or explicit_base_url)
         should_use_pool = (

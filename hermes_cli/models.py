@@ -5744,6 +5744,41 @@ def probe_api_models(
     }
 
 
+def endpoint_listing_is_authoritative(
+    base_url: Optional[str],
+    timeout: float = 3.0,
+) -> bool:
+    """Whether a missing model in this endpoint's listing proves it absent.
+
+    Most OpenAI-compatible proxies (LiteLLM, gateway shims, Anthropic
+    bridges) serve a partial ``/v1/models`` and still route hidden or
+    aliased names, so absence from the listing is not evidence — which is
+    why the custom-provider path soft-accepts unknown names by default.
+
+    Ollama is the opposite: it exposes its own native ``/api/tags`` listing
+    every pulled model, and asking for one that isn't there returns
+    ``404 model '<name>' not found`` at generation time.  Detect that case
+    so the caller can reject a typo up front instead of deferring the
+    failure to the user's first message.
+    """
+    normalized = (base_url or "").strip().rstrip("/")
+    if not normalized:
+        return False
+    root = normalized[:-3].rstrip("/") if normalized.endswith("/v1") else normalized
+    req = urllib.request.Request(
+        root + "/api/tags",
+        headers={"User-Agent": _HERMES_USER_AGENT},
+    )
+    try:
+        with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return False
+    # Ollama always returns {"models": [...]}; an empty server still sends
+    # the key. Anything else means this is not an Ollama-style listing.
+    return isinstance(data, dict) and isinstance(data.get("models"), list)
+
+
 # Legacy filter — used when an item has no surface tag (rolling out
 # 2026-05). Once every model returned by the catalog endpoint carries an
 # explicit surface tag (``chat``/``embed``/``image-gen``/``tts``/``stt``)
@@ -6514,6 +6549,22 @@ def validate_requested_model(
             suggestion_text = ""
             if suggestions:
                 suggestion_text = "\n  Similar models: " + ", ".join(f"`{s}`" for s in suggestions)
+
+            # When the endpoint's listing is authoritative (Ollama), absence is
+            # proof: accepting here would only defer the 404 to the user's first
+            # message, after the switch already reported success.
+            if endpoint_listing_is_authoritative(probe.get("resolved_base_url") or base_url):
+                return {
+                    "accepted": False,
+                    "persist": False,
+                    "recognized": False,
+                    "message": (
+                        f"Model `{requested}` is not available on this endpoint "
+                        f"({probe.get('probed_url')}). Pull it first with "
+                        f"`ollama pull {requested}`, or pick one that is already "
+                        f"installed.{suggestion_text}"
+                    ),
+                }
 
             message = (
                 f"Note: `{requested}` was not found in this custom endpoint's model listing "

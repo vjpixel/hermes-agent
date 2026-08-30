@@ -7210,6 +7210,7 @@ async def get_model_options(
     refresh: bool = False,
     include_unconfigured: bool = False,
     explicit_only: bool = False,
+    show_all: bool = False,
 ):
     """Return authenticated providers + their curated model lists.
 
@@ -7225,6 +7226,11 @@ async def get_model_options(
     ``refresh`` busts the per-provider model-id disk cache so every row
     re-fetches its live catalog — used by the picker's explicit "Refresh
     Models" control. Normal opens leave it false to stay on the 1h cache.
+
+    ``show_all`` bypasses ``model_catalog.picker_scope: routing`` (#6673)
+    for this one request — intended for a dashboard "Show all models"
+    control; no such control is wired up as of this parameter's addition,
+    this is the query-param plumbing for one to call.
     """
     try:
         skew_msg = _dashboard_code_skew_guard()
@@ -7246,6 +7252,7 @@ async def get_model_options(
                     explicit_only=bool(explicit_only),
                     include_unconfigured=bool(include_unconfigured),
                     refresh=bool(refresh),
+                    show_all=bool(show_all),
                 )
 
         return await run_in_threadpool(_build_payload_scoped)

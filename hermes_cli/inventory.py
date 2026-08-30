@@ -33,8 +33,11 @@ Substrate facts (verified May 2026):
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from typing import Any, Optional
+
+_log = logging.getLogger(__name__)
 
 
 # ─── Public types ───────────────────────────────────────────────────────
@@ -53,6 +56,8 @@ class ConfigContext:
     user_providers: dict
     custom_providers: list
     excluded_providers: list = None
+    picker_scope: str = "all"
+    routing_pairs: frozenset = frozenset()
 
     def with_overrides(
         self,
@@ -98,6 +103,7 @@ def load_picker_context() -> ConfigContext:
         current_base_url = ""
     raw = cfg.get("providers")
     excluded = cfg.get("model_catalog", {}).get("excluded_providers") or []
+    picker_scope, routing_pairs = resolve_routing_scope(cfg)
     return ConfigContext(
         current_provider=current_provider,
         current_model=current_model,
@@ -105,7 +111,167 @@ def load_picker_context() -> ConfigContext:
         user_providers=raw if isinstance(raw, dict) else {},
         custom_providers=get_compatible_custom_providers(cfg),
         excluded_providers=excluded if isinstance(excluded, list) else [],
+        picker_scope=picker_scope,
+        routing_pairs=routing_pairs,
     )
+
+
+# ─── Public: picker-scope (routing allowlist, #6673) ────────────────────
+
+
+def _extract_provider_model_pairs(node: Any) -> set[tuple[str, str]]:
+    """Recursively collect every ``{provider, model}`` pair found in ``node``.
+
+    Deliberately schema-agnostic: it does not hardcode ``primary_model`` /
+    ``fallback_chain`` / ``fallback_chains`` key names, so it survives the
+    next fallback-chain rotation (like #6663) without a code change — any
+    dict anywhere under ``smart_model_routing`` that carries non-empty
+    string ``provider`` and ``model`` keys counts, regardless of how deep
+    or under what key it is nested.
+    """
+    pairs: set[tuple[str, str]] = set()
+    if isinstance(node, dict):
+        provider = node.get("provider")
+        model = node.get("model")
+        if (
+            isinstance(provider, str)
+            and isinstance(model, str)
+            and provider.strip()
+            and model.strip()
+        ):
+            pairs.add((provider.strip(), model.strip()))
+        for value in node.values():
+            pairs |= _extract_provider_model_pairs(value)
+    elif isinstance(node, list):
+        for item in node:
+            pairs |= _extract_provider_model_pairs(item)
+    return pairs
+
+
+def resolve_routing_scope(cfg: dict) -> tuple[str, frozenset[tuple[str, str]]]:
+    """Read ``model_catalog.picker_scope`` + derive the routing allowlist.
+
+    Returns ``(scope, routing_pairs)``:
+
+    - ``scope`` is ``"all"`` (default, today's behavior — every consumer of
+      this module keeps listing the full inventory) or ``"routing"``.
+    - ``routing_pairs`` is the union of every ``(provider, model)`` pair
+      found anywhere under ``smart_model_routing`` (the setup wizard's
+      primary-model + fallback-chain declarations, whatever their exact
+      nesting — see :func:`_extract_provider_model_pairs`) plus
+      ``model_catalog.picker_extras``. Only populated when ``scope ==
+      "routing"`` — building it is wasted work otherwise.
+
+    An unrecognized ``picker_scope`` value fails open to ``"all"`` rather
+    than silently narrowing (or erroring) the picker on a typo.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    model_catalog_cfg = cfg.get("model_catalog")
+    if not isinstance(model_catalog_cfg, dict):
+        model_catalog_cfg = {}
+
+    scope = str(model_catalog_cfg.get("picker_scope") or "all").strip().lower()
+    if scope not in ("all", "routing"):
+        _log.debug(
+            "Unrecognized model_catalog.picker_scope=%r — defaulting to 'all' "
+            "(full inventory). Valid values: 'all', 'routing'.",
+            scope,
+        )
+        scope = "all"
+
+    if scope != "routing":
+        return scope, frozenset()
+
+    pairs = _extract_provider_model_pairs(cfg.get("smart_model_routing"))
+    pairs |= _extract_provider_model_pairs(model_catalog_cfg.get("picker_extras"))
+    return scope, frozenset(pairs)
+
+
+def _row_provider_keys(row: dict) -> set[str]:
+    """Every identity a provider row answers to: slug + known aliases.
+
+    Custom-provider rows are keyed in ``smart_model_routing`` under
+    whatever spelling the editor wrote in ``config.yaml`` (often the bare
+    ``custom`` overlay name, not the ``custom:<key>`` canonical identity
+    the row's ``slug`` carries), so matching on ``slug`` alone would drop
+    every custom-endpoint route. Reuses the same alias set
+    :func:`_apply_custom_aliases` attaches, computing it locally when the
+    caller (e.g. the gateway picker) never ran that pass.
+    """
+    keys = {str(row.get("slug") or "").strip().lower()}
+    aliases = row.get("aliases")
+    if aliases:
+        keys.update(str(a).strip().lower() for a in aliases)
+    elif row.get("is_user_defined"):
+        try:
+            from hermes_cli.providers import custom_provider_aliases
+
+            keys.update(
+                a.lower()
+                for a in custom_provider_aliases(
+                    str(row.get("name", "")), str(row.get("slug", ""))
+                )
+            )
+        except Exception:
+            # Falling back to slug-only matching here is exactly the
+            # failure mode this alias lookup exists to avoid (see
+            # docstring) — log it so a routing entry that vanishes from
+            # the picker for a custom provider has a breadcrumb instead
+            # of looking like a config mistake.
+            _log.warning(
+                "custom_provider_aliases failed for row slug=%r name=%r — "
+                "falling back to slug-only matching for picker_scope=routing",
+                row.get("slug"), row.get("name"),
+                exc_info=True,
+            )
+    keys.discard("")
+    return keys
+
+
+def apply_routing_scope(
+    rows: list[dict],
+    *,
+    scope: str,
+    routing_pairs: frozenset[tuple[str, str]],
+) -> list[dict]:
+    """Narrow provider rows' ``models`` to a routing-derived allowlist.
+
+    The ONE filter every ``/model`` listing surface (CLI, TUI, dashboard,
+    gateway Telegram/Discord) applies when ``model_catalog.picker_scope ==
+    "routing"`` (#6673) — never re-implemented per surface. This is a
+    LISTING-only restriction: it must never be called on the explicit
+    ``/model <id>``/``switch_model()`` path, which stays free to target any
+    model regardless of scope.
+
+    ``scope != "routing"`` (the default, ``"all"``) is a no-op passthrough
+    — today's full-inventory picker. An empty ``routing_pairs`` (routing
+    scope requested but nothing derivable — ``smart_model_routing`` unset
+    or empty) also passes rows through unchanged: an empty picker is a
+    worse failure than the full inventory when the config isn't populated
+    yet.
+    """
+    if scope != "routing" or not routing_pairs:
+        return rows
+
+    by_provider: dict[str, set[str]] = {}
+    for provider, model in routing_pairs:
+        by_provider.setdefault(provider.strip().lower(), set()).add(model)
+
+    filtered: list[dict] = []
+    for row in rows:
+        allowed: set[str] = set()
+        for key in _row_provider_keys(row):
+            allowed |= by_provider.get(key, set())
+        if not allowed:
+            continue
+        models = [m for m in (row.get("models") or []) if m in allowed]
+        if not models:
+            continue
+        new_row = dict(row)
+        new_row["models"] = models
+        new_row["total_models"] = len(models)
+        filtered.append(new_row)
+    return filtered
 
 
 # ─── Public: payload builder ────────────────────────────────────────────
@@ -127,6 +293,8 @@ def build_models_payload(
     probe_current_custom_provider: bool = False,
     for_picker: bool = False,
     max_models: int | None = None,
+    scope_to_routing: bool = False,
+    show_all: bool = False,
 ) -> dict:
     """Build the ``{providers, model, provider}`` shape every consumer
     needs from a single substrate call.
@@ -182,6 +350,21 @@ def build_models_payload(
       list. Rate limits are per-model, so a different model under the same
       provider may still work; hiding the provider strands the user. Set for
       any surface a human is choosing from, not for programmatic resolution.
+    - ``scope_to_routing``: apply ``ctx.picker_scope``/``ctx.routing_pairs``
+      (see :func:`apply_routing_scope`, #6673) after every other row
+      post-processing step. Defaults False; only the surfaces that ARE the
+      ``/model`` picker set this True (``build_model_options_payload`` and
+      the CLI ``/model`` picker). No other current caller sets it — every
+      non-``/model`` picker (vision, compression, recommended-default
+      resolution, ``model.save_key``, and any future auxiliary consumer)
+      leaves it at the False default on purpose, since those choices are
+      not governed by chat-routing scope. Check this default before wiring
+      a NEW caller rather than assuming the list above is exhaustive.
+    - ``show_all``: per-call escape hatch (``/model --all``) that bypasses
+      ``scope_to_routing`` for this one build, even when the config has
+      ``picker_scope: routing``. Never affects the explicit ``/model <id>``
+      switch path — that path never calls this function's scope filter at
+      all.
     """
     from hermes_cli.model_switch import list_authenticated_providers
 
@@ -274,6 +457,11 @@ def build_models_payload(
         _apply_featured(rows)
     _apply_custom_aliases(rows)
 
+    if scope_to_routing and not show_all:
+        rows = apply_routing_scope(
+            rows, scope=ctx.picker_scope, routing_pairs=ctx.routing_pairs
+        )
+
     return {
         "providers": rows,
         "model": ctx.current_model,
@@ -287,6 +475,7 @@ def build_model_options_payload(
     explicit_only: bool = False,
     include_unconfigured: bool = False,
     refresh: bool = False,
+    show_all: bool = False,
 ) -> dict:
     """Build the shared API-server/dashboard/TUI model-options payload.
 
@@ -297,6 +486,10 @@ def build_model_options_payload(
       endpoints do not block the picker
     - explicit refresh: probe every custom provider while busting the model
       cache so live catalogs repopulate fully
+
+    Always requests ``scope_to_routing`` — this IS the ``/model`` picker
+    payload for the dashboard and TUI (#6673); ``show_all`` (``/model
+    --all``) opts a single call back out to the full inventory.
     """
     refresh = bool(refresh)
     return build_models_payload(
@@ -311,6 +504,8 @@ def build_model_options_payload(
         refresh=refresh,
         probe_custom_providers=refresh,
         probe_current_custom_provider=not refresh,
+        scope_to_routing=True,
+        show_all=bool(show_all),
     )
 
 

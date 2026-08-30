@@ -483,6 +483,12 @@ def _(rid, params: dict) -> dict:
             explicit_only=bool(params.get("explicit_only")),
             include_unconfigured=bool(params.get("include_unconfigured")),
             refresh=bool(params.get("refresh")),
+            # "show_all" (not "all") to match the param name every other
+            # surface uses (dashboard REST's show_all query param,
+            # cli.py's request.show_all, model_switch's --all -> show_all)
+            # — no frontend calls this new param yet, so there is no
+            # compat reason to diverge here (#6673).
+            show_all=bool(params.get("show_all")),
         )
         return _ok(rid, payload)
     except Exception as e:

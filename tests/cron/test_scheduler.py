@@ -2248,6 +2248,39 @@ class TestCronDeliveryMirror:
         assert args[2].startswith("[Cron delivery: Morning Brief]")
         assert "Market movers today" in args[2]
 
+    def test_continuable_mirror_reports_when_reply_surface_is_missing(self):
+        """A continuable delivery must expose mirror failure to its caller."""
+        from cron.scheduler import _maybe_mirror_cron_delivery
+
+        with patch("gateway.mirror.mirror_to_session", return_value=False):
+            assert _maybe_mirror_cron_delivery(
+                {"id": "j1", "name": "Morning Brief"},
+                "telegram", "123", "Market movers today", enabled=True,
+            ) is False
+
+    def test_continuable_delivery_does_not_report_success_without_mirror(self):
+        """A send that cannot be attached must be a visible delivery failure."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        job = {
+            "id": "continuable-job",
+            "name": "daily-report",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+            "attach_to_session": True,
+        }
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("gateway.mirror.mirror_to_session", return_value=False):
+            result = _deliver_result(job, "Here is today's summary.")
+
+        assert result is not None
+        assert "continuation reply surface" in result
+
 
     def test_delivery_mirrors_clean_content_not_wrapped(self):
         """When enabled, the mirror receives the CLEAN agent output, not the

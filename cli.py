@@ -11343,8 +11343,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     ctx,
                     probe_custom_providers=force_refresh,
                     probe_current_custom_provider=not force_refresh,
+                    scope_to_routing=True,
+                    show_all=request.show_all,
                 )["providers"]
             except Exception:
+                # Logged (not just swallowed) so a bug in the picker-scope
+                # filtering (#6673) or any other payload-build step doesn't
+                # masquerade as "No authenticated providers found" below —
+                # that message is only correct when there really are none.
+                logger.debug("build_models_payload failed for /model picker", exc_info=True)
                 providers = []
 
             if not providers:

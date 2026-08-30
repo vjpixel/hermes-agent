@@ -1679,29 +1679,28 @@ def _maybe_mirror_cron_delivery(
     user_id: Optional[str] = None,
     *,
     enabled: bool = False,
-) -> None:
-    """Best-effort mirror of a cron delivery into the origin chat's session.
+) -> bool:
+    """Mirror a cron delivery and report whether the reply surface was attached.
 
     No-op unless ``enabled`` (resolved once by the caller, and already scoped to
     the origin target — see ``_target_matches_origin``). Reuses the shipped
     ``mirror_to_session`` so cron rides exactly the same path that interactive
     ``send_message`` mirroring already uses, including passing ``user_id`` so a
     per-user-isolated group chat resolves to the exact member who scheduled the
-    job (parity with ``send_message``). All failures are swallowed — a delivery
-    that succeeded must never be reported as failed because the transcript
-    mirror hit a problem.
+    job (parity with ``send_message``). Mirror failures are logged and returned
+    as ``False``; the caller decides whether that is fatal for the job.
 
     Because the caller only enables this for the target that equals the job's
-    origin conversation, the session is expected to exist (the job was born in
-    that session). A missing session therefore indicates an origin-less /
-    fan-out delivery that should not have been mirrored anyway, and is treated
-    as a silent no-op — never a synthetic session is created.
+    origin conversation, the session is expected to exist (the brief was born
+    in that session). A missing session is reported to the caller as ``False``
+    so continuable jobs cannot silently degrade to fire-and-forget;
+    non-continuable callers may continue treating it as a best-effort no-op.
     """
     if not enabled:
-        return
+        return False
     text = (mirror_text or "").strip()
     if not text:
-        return
+        return False
     try:
         from gateway.mirror import mirror_to_session
 
@@ -1733,11 +1732,24 @@ def _maybe_mirror_cron_delivery(
                 "(no matching gateway session — cold start)",
                 job.get("id", "?"), platform_name, chat_id,
             )
+        return bool(ok)
     except Exception as e:
         logger.debug(
             "Job '%s': delivery mirror failed for %s:%s: %s",
             job.get("id", "?"), platform_name, chat_id, e,
         )
+        return False
+
+
+def _continuable_job_requested(job: dict) -> bool:
+    """Whether a job promises a user-reply continuation surface.
+
+    ``attach_to_session`` is the persisted public switch. ``continuity`` is
+    accepted for callers that construct job dictionaries directly. The
+    reserved ``context_from=[\"self\"]`` feature is intentionally excluded: it
+    carries the job's prior output, but does not make user replies continuable.
+    """
+    return job.get("attach_to_session") is True or job.get("continuity") is True
 
 
 def _open_continuable_cron_thread(
@@ -1787,7 +1799,7 @@ def _seed_cron_thread_session(
     chat_name: Optional[str] = None,
     is_dm: bool = False,
     scope_id: Optional[str] = None,
-) -> None:
+) -> bool:
     """Seed the freshly-opened cron thread's session with the brief.
 
     Without this the brief is *visible* in the new thread but absent from any
@@ -1820,7 +1832,7 @@ def _seed_cron_thread_session(
     """
     text = (mirror_text or "").strip()
     if not text:
-        return
+        return False
     try:
         from gateway.config import Platform
         from gateway.session import SessionSource
@@ -1891,6 +1903,7 @@ def _seed_cron_thread_session(
                 "in-thread reply will not see this brief",
                 job.get("id", "?"), platform_name, chat_id, thread_id,
             )
+        return bool(ok)
     except Exception as e:
         # WARNING, not debug: a silent seed failure IS the continuation-
         # amnesia bug (Alice 2026-08-19) — it must be visible in production.
@@ -1898,6 +1911,7 @@ def _seed_cron_thread_session(
             "Job '%s': seeding cron thread session failed for %s:%s:%s: %s",
             job.get("id", "?"), platform_name, chat_id, thread_id, e,
         )
+        return False
 
 
 def _seed_cron_channel_session(
@@ -2944,10 +2958,24 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         else []
     )
 
-    # Resolve the delivery-mirror gate ONCE (default off). When on, each
-    # successful delivery is also appended to the target chat's gateway session
-    # transcript so a user reply in that chat sees the cron output in context.
-    # Mirror the CLEAN, unwrapped output (not the cron header/footer).
+    # A continuable job is not merely a delivery request: its reply surface is
+    # part of the contract.  Keep the ordinary mirror gate unchanged for all
+    # other jobs, but never let an attach/continuity job silently become
+    # fire-and-forget when the mirror cannot be confirmed.
+    continuable = _continuable_job_requested(job)
+    origin = _resolve_origin(job) or {}
+    if continuable:
+        if not origin:
+            return "continuation reply surface unavailable: job has no valid origin"
+        if not any(
+            _target_matches_origin(
+                origin, target.get("platform", ""), target.get("chat_id", ""),
+                target.get("thread_id"),
+            )
+            for target in targets
+        ):
+            return "continuation reply surface unavailable: delivery target is not the origin"
+
     try:
         mirror_enabled = _cron_mirror_delivery_enabled(job, user_cfg)
     except Exception:
@@ -3467,7 +3495,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
                     if opened_thread_id and not thread_seeded:
-                        _seed_cron_thread_session(
+                        seeded = _seed_cron_thread_session(
                             job, runtime_adapter, platform_name, chat_id,
                             opened_thread_id, mirror_text,
                             chat_name=origin.get("chat_name"),
@@ -3475,6 +3503,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             scope_id=origin.get("scope_id"),
                         )
                         thread_seeded = True
+                        if continuable and not seeded:
+                            delivery_errors.append(
+                                f"continuation reply surface unavailable for {platform_name}:{chat_id}"
+                            )
                     # in_channel surface: CREATE + seed the flat channel/DM
                     # session (the shipped mirror only appends to an existing
                     # session — the flat row is otherwise absent for a
@@ -3525,11 +3557,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             origin.get("platform"), origin.get("chat_id"),
                             origin.get("thread_id"),
                         )
-                    _maybe_mirror_cron_delivery(
+                        if continuable and not inchannel_seeded:
+                            delivery_errors.append(
+                                f"continuation reply surface unavailable for {platform_name}:{chat_id}"
+                            )
+                    mirror_attached = _maybe_mirror_cron_delivery(
                         job, platform_name, chat_id, mirror_text,
                         thread_id=thread_id, user_id=origin_user_id,
                         enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
                     )
+                    if continuable and mirror_this_target and not thread_seeded and not inchannel_seeded and not mirror_attached:
+                        delivery_errors.append(
+                            f"continuation reply surface unavailable for {platform_name}:{chat_id}"
+                        )
             except Exception as e:
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
@@ -3645,11 +3685,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.append(msg)
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
-            _maybe_mirror_cron_delivery(
+            mirror_attached = _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
                 thread_id=thread_id, user_id=origin_user_id,
                 enabled=mirror_this_target and not thread_seeded,
             )
+            if continuable and mirror_this_target and not thread_seeded and not mirror_attached:
+                delivery_errors.append(
+                    f"continuation reply surface unavailable for {platform_name}:{chat_id}"
+                )
 
     if policy_drop_errors:
         # Filter-time drops apply to every target; report them once.

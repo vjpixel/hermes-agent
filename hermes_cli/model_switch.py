@@ -639,6 +639,7 @@ class ModelFlagParseResult:
     force_refresh: bool = False
     is_session: bool = False
     is_once: bool = False
+    show_all: bool = False
 # ---------------------------------------------------------------------------
 # Flag parsing
 # ---------------------------------------------------------------------------
@@ -655,6 +656,12 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
     :func:`resolve_persist_behavior` so the config-gated default
     (``model.persist_switch_by_default``) is applied in one place.
 
+    ``--all`` (``show_all``) is the escape hatch for
+    ``model_catalog.picker_scope: routing`` (#6673): a listing surface that
+    honors picker scope must show the FULL inventory for this one call when
+    the flag is present, ignoring config. It never affects an explicit
+    model target \u2014 the switch itself was never scope-restricted.
+
     Examples::
 
         "sonnet"                         -> ("sonnet", "", False, False, False)
@@ -665,17 +672,19 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
         "--provider my-ollama"           -> ("", "my-ollama", False, False, False)
         "--refresh"                      -> ("", "", False, True, False)
         "sonnet --provider anthropic --global" -> ("sonnet", "anthropic", True, False, False)
+        "--all"                          -> show_all=True
     """
     is_global = False
     explicit_provider = ""
     force_refresh = False
     is_session = False
     is_once = False
+    show_all = False
 
     # Normalize Unicode dashes (Telegram/iOS auto-converts -- to em/en dash)
     # A single Unicode dash before a flag keyword becomes "--"
     import re as _re
-    raw_args = _re.sub(r'[\u2012\u2013\u2014\u2015](provider|global|session|refresh|once)', r'--\1', raw_args)
+    raw_args = _re.sub(r'[\u2012\u2013\u2014\u2015](provider|global|session|refresh|once|all)', r'--\1', raw_args)
 
     # Keep this hand-rolled because model IDs may contain colons/slashes and
     # the historical parser did not require shell quoting.
@@ -695,6 +704,9 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
         elif parts[i] == "--once":
             is_once = True
             i += 1
+        elif parts[i] == "--all":
+            show_all = True
+            i += 1
         elif parts[i] == "--provider" and i + 1 < len(parts):
             explicit_provider = parts[i + 1]
             i += 2
@@ -710,6 +722,7 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
         force_refresh=force_refresh,
         is_session=is_session,
         is_once=is_once,
+        show_all=show_all,
     )
 
 
@@ -821,6 +834,7 @@ class ModelSwitchRequest:
     is_session: bool = False
     is_once: bool = False
     force_refresh: bool = False
+    show_all: bool = False
     scope: str = "default"
     errors: tuple = ()
 
@@ -839,6 +853,7 @@ class ModelSwitchRequest:
             force_refresh=self.force_refresh,
             is_session=self.is_session,
             is_once=self.is_once,
+            show_all=self.show_all,
         )
 
     def error_messages(self) -> list:
@@ -890,6 +905,7 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
         is_session=parsed.is_session,
         is_once=parsed.is_once,
         force_refresh=parsed.force_refresh,
+        show_all=parsed.show_all,
         scope=scope,
         errors=tuple(errors),
     )
@@ -3932,6 +3948,8 @@ def list_picker_providers(
     current_model: str = "",
     include_moa: bool = False,
     excluded_providers: list | None = None,
+    picker_scope: str = "all",
+    routing_pairs: frozenset | None = None,
 ) -> List[dict]:
     """Interactive-picker variant of :func:`list_authenticated_providers`.
 
@@ -3947,6 +3965,19 @@ def list_picker_providers(
     - Provider rows whose model list ends up empty are dropped, except
       custom endpoints (``is_user_defined=True`` with an ``api_url``) where
       the user may supply their own model set through config.
+    - ``picker_scope="routing"`` (#6673) additionally narrows every row's
+      models to ``routing_pairs`` via
+      :func:`hermes_cli.inventory.apply_routing_scope` — the same filter
+      the CLI/TUI/dashboard picker applies, so the gateway (Telegram/
+      Discord) ``/model`` picker matches them instead of drifting with its
+      own copy of the restriction. Callers passing a numeric ``max_models``
+      together with ``picker_scope="routing"`` must pass ``max_models=None``
+      instead when scope is active — this function's OpenRouter live-
+      substitution above (and the base ``list_authenticated_providers``
+      curated-list truncation) both happen BEFORE the scope filter runs, so
+      a numeric cap can silently drop a routing-allowlisted model sitting
+      past that position — the same ordering hazard the gateway text-list
+      fallback in ``gateway/slash_commands.py`` documents and avoids.
 
     All other providers and metadata fields are passed through unchanged.
     The typed ``/model <name>`` path is unaffected -- only the interactive
@@ -3985,5 +4016,12 @@ def list_picker_providers(
         if not has_models and not is_custom_endpoint:
             continue
         filtered.append(p)
+
+    if picker_scope == "routing":
+        from hermes_cli.inventory import apply_routing_scope
+
+        filtered = apply_routing_scope(
+            filtered, scope=picker_scope, routing_pairs=routing_pairs or frozenset()
+        )
 
     return filtered
